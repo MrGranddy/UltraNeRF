@@ -8,6 +8,8 @@ from tqdm import trange
 from run_ultranerf_helpers import *
 from load_us import load_us_data
 
+import matplotlib.pyplot as plt
+
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 np.random.seed(0)
@@ -15,13 +17,13 @@ DEBUG = False
 
 def gaussian_kernel(size: int, mean: float, std: float):
     delta_t = 1.0
-    x_cos = torch.arange(-size, size + 1, dtype=torch.float32) * delta_t
+    x_cos = torch.arange(-size, size + 1, dtype=torch.float32, device=device) * delta_t
 
     d1 = torch.distributions.Normal(mean, std * 2.0)
     d2 = torch.distributions.Normal(mean, std)
 
-    vals_x = torch.exp(d1.log_prob(x_cos))
-    vals_y = torch.exp(d2.log_prob(x_cos))
+    vals_x = torch.exp(d1.log_prob(x_cos)).to(device)
+    vals_y = torch.exp(d2.log_prob(x_cos)).to(device)
 
     gauss_kernel = torch.outer(vals_x, vals_y)
     gauss_kernel /= torch.sum(gauss_kernel)
@@ -44,17 +46,11 @@ def batchify(fn, chunk):
     return ret
 
 
-def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
+def run_network(inputs, fn, embed_fn, netchunk=1024*64):
     """Prepares inputs and applies network 'fn'.
     """
     inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]])
     embedded = embed_fn(inputs_flat)
-
-    if viewdirs is not None:
-        input_dirs = viewdirs[:,None].expand(inputs.shape)
-        input_dirs_flat = torch.reshape(input_dirs, [-1, input_dirs.shape[-1]])
-        embedded_dirs = embeddirs_fn(input_dirs_flat)
-        embedded = torch.cat([embedded, embedded_dirs], -1)
 
     outputs_flat = batchify(fn, netchunk)(embedded)
     outputs = torch.reshape(outputs_flat, list(inputs.shape[:-1]) + [outputs_flat.shape[-1]])
@@ -135,7 +131,7 @@ def render_method_convolutional_ultrasound(raw, z_vals):
     return ret
 
 
-def batchify_rays(rays_flat, c2w=None,chunk=1024*32, **kwargs):
+def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
     """Render rays in smaller minibatches to avoid OOM.
     """
     all_ret = {}
@@ -151,8 +147,7 @@ def batchify_rays(rays_flat, c2w=None,chunk=1024*32, **kwargs):
 
 
 def render_us(H, W, sw, sh, chunk=1024*32, rays=None, c2w=None,
-                  near=0., far=55. * 0.001,
-                  use_viewdirs=False, **kwargs):
+                  near=0., far=55. * 0.001, **kwargs):
     """Render rays
     """
     if c2w is not None:
@@ -162,12 +157,6 @@ def render_us(H, W, sw, sh, chunk=1024*32, rays=None, c2w=None,
             raise ValueError("Must provide rays if c2w is not provided")
         rays_o, rays_d = rays
 
-    if use_viewdirs:
-        # provide ray directions as input
-        viewdirs = rays_d
-        viewdirs = viewdirs / torch.norm(viewdirs, dim=-1, keepdim=True)
-        viewdirs = torch.reshape(viewdirs, [-1,3]).float()
-
     sh = rays_d.shape # [..., 3]
 
     # Create ray batch
@@ -175,12 +164,12 @@ def render_us(H, W, sw, sh, chunk=1024*32, rays=None, c2w=None,
     rays_d = torch.reshape(rays_d, [-1,3]).float()
 
     near, far = near * torch.ones_like(rays_d[...,:1]), far * torch.ones_like(rays_d[...,:1])
+    near, far = near.to(device), far.to(device)
+
     rays = torch.cat([rays_o, rays_d, near, far], -1)
-    if use_viewdirs:
-        rays = torch.cat([rays, viewdirs], -1)
 
     # Render and reshape
-    all_ret = batchify_rays(rays, c2w, chunk, **kwargs)
+    all_ret = batchify_rays(rays, chunk, **kwargs)
 
     for k in all_ret:
         k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
@@ -192,22 +181,20 @@ def render_us(H, W, sw, sh, chunk=1024*32, rays=None, c2w=None,
 def create_nerf(args):
     """Instantiate NeRF's MLP model.
     """
-    embed_fn, input_ch = get_embedder(args.multires, args.i_embed, args.i_embed_gauss)
+    embed_fn, input_ch = get_embedder(args.multires, device, args.i_embed, args.i_embed_gauss)
 
     input_ch_views = 0
     embeddirs_fn = None
-    if args.use_viewdirs:
-        embeddirs_fn, input_ch_views = get_embedder(args.multires_views, args.i_embed, args.i_embed_gauss)
+
     output_ch = args.output_ch
     skips = [4]
     model = NeRF(D=args.netdepth, W=args.netwidth,
                  input_ch=input_ch, output_ch=output_ch, skips=skips,
-                 input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
+                 input_ch_views=input_ch_views).to(device)
     grad_vars = list(model.parameters())
 
-    network_query_fn = lambda inputs, viewdirs, network_fn : run_network(inputs, viewdirs, network_fn,
+    network_query_fn = lambda inputs, network_fn : run_network(inputs, network_fn,
                                                                 embed_fn=embed_fn,
-                                                                embeddirs_fn=embeddirs_fn,
                                                                 netchunk=args.netchunk)
 
     # Create optimizer
@@ -243,7 +230,6 @@ def create_nerf(args):
         'network_query_fn' : network_query_fn,
         'N_samples' : args.N_samples,
         'network_fn' : model,
-        'use_viewdirs' : args.use_viewdirs,
     }
 
     render_kwargs_test = {k : render_kwargs_train[k] for k in render_kwargs_train}
@@ -255,20 +241,18 @@ def render_rays(ray_batch,
                 network_fn,
                 network_query_fn,
                 N_samples,
-                retraw=False,
                 lindisp=False,
-                args=None,
     ):
     """Volumetric rendering.
     """
 
     N_rays = ray_batch.shape[0]
     rays_o, rays_d = ray_batch[:,0:3], ray_batch[:,3:6] # [N_rays, 3] each
-    viewdirs = ray_batch[:,-3:] if ray_batch.shape[-1] > 8 else None
     bounds = torch.reshape(ray_batch[...,6:8], [-1,1,2])
     near, far = bounds[...,0], bounds[...,1] # [-1,1]
 
-    t_vals = torch.linspace(0., 1., steps=N_samples)
+    t_vals = torch.linspace(0., 1., steps=N_samples, device=device)
+
     if not lindisp:
         z_vals = near * (1.-t_vals) + far * (t_vals)
     else:
@@ -281,7 +265,7 @@ def render_rays(ray_batch,
     step = rays_d[..., None, :] * z_vals[..., :, None]
     pts = origin + step
 
-    raw = network_query_fn(pts, viewdirs, network_fn)
+    raw = network_query_fn(pts, network_fn)
     ret = render_method_convolutional_ultrasound(raw, z_vals)
 
     return ret
@@ -337,8 +321,6 @@ def config_parser():
     # rendering options
     parser.add_argument("--N_samples", type=int, default=64, 
                         help='number of coarse samples per ray')
-    parser.add_argument("--use_viewdirs", action='store_true', 
-                        help='use full 5D input instead of 3D')
     parser.add_argument("--i_embed", type=int, default=0, 
                         help='set 0 for default positional encoding, -1 for none')
     parser.add_argument("--i_embed_gauss", type=int, default=0,
@@ -373,11 +355,11 @@ def config_parser():
 
 
     # logging/saving options
-    parser.add_argument("--i_print",   type=int, default=50, 
+    parser.add_argument("--i_print",   type=int, default=200, 
                         help='frequency of console printout and metric loggin')
     parser.add_argument("--i_img",     type=int, default=100, 
                         help='frequency of tensorboard image logging')
-    parser.add_argument("--i_weights", type=int, default=100, 
+    parser.add_argument("--i_weights", type=int, default=2000, 
                         help='frequency of weight ckpt saving')
     parser.add_argument("--i_testset", type=int, default=5000000, 
                         help='frequency of testset saving')
@@ -429,15 +411,13 @@ def train():
     sw = sx
     # H, W = int(H), int(W)
 
-    if args.render_test:
-        render_poses = np.array(poses[i_test])
 
     # Create log dir and copy the config file
     basedir = args.basedir
     expname = args.expname
 
     os.makedirs(os.path.join(basedir, expname), exist_ok=True)
-    
+
     f = os.path.join(basedir, expname, 'args.txt')
     with open(f, 'w') as file:
         for arg in sorted(vars(args)):
@@ -459,9 +439,6 @@ def train():
     render_kwargs_train.update(bds_dict)
     render_kwargs_test.update(bds_dict)
 
-    # Move testing data to GPU
-    render_poses = torch.Tensor(render_poses).to(device)
-
     N_iters = args.n_iters
 
     print('Begin')
@@ -477,12 +454,10 @@ def train():
         time0 = time.time()
 
         img_i = np.random.choice(i_train)
-        try:
-            target = torch.transpose(images[img_i], 0, 1)
-        except Exception as e:
-            print(e)
+        target = torch.transpose(torch.tensor(images[img_i]), 0, 1).to(device)
 
-        pose = torch.from_numpy(poses[img_i, :3, :4])
+
+        pose = torch.from_numpy(poses[img_i, :3, :4]).to(device)
         ssim_weight = args.ssim_lambda
         l2_weight = 1. - ssim_weight
 
@@ -495,8 +470,7 @@ def train():
         #####  Core optimization loop  #####
         
         rendering_output = render_us(
-            H, W, sw, sh, chunk=args.chunk, c2w=pose, rays=batch_rays,
-            retraw=True, **render_kwargs_train
+            H, W, sw, sh, chunk=args.chunk, c2w=pose, rays=batch_rays, **render_kwargs_train
         )
 
         output_image = rendering_output['intensity_map']
@@ -525,7 +499,8 @@ def train():
         ################################
 
         dt = time.time()-time0
-        # print(f"Step: {global_step}, Loss: {loss}, Time: {dt}")
+        if i%args.i_print==0:
+            print(f"Step: {global_step}, Loss: {total_loss.item()}, Time: {dt}")
         #####           end            #####
 
         # Rest is logging
@@ -534,16 +509,14 @@ def train():
             torch.save({
                 'global_step': global_step,
                 'network_fn_state_dict': render_kwargs_train['network_fn'].state_dict(),
-                'network_fine_state_dict': render_kwargs_train['network_fine'].state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
             }, path)
-            print('Saved checkpoints at', path)
+            #print('Saved checkpoints at', path)
 
 
         global_step += 1
 
 
 if __name__=='__main__':
-    torch.set_default_tensor_type('torch.cuda.FloatTensor')
 
     train()
