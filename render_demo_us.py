@@ -9,7 +9,7 @@ import imageio
 import matplotlib.pyplot as plt
 import torch
 
-import run_ultra_nerf as run_nerf_ultrasound
+import run_ultra_nerf_old as run_nerf_ultrasound
 from load_us import load_us_data
 
 class UltrasoundNerfProcessor:

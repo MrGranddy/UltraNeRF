@@ -1,37 +1,33 @@
 import numpy as np
-import os, imageio
+import os
 
+from PIL import Image
 
 ########## Slightly modified version of LLFF data loading code 
 ##########  see https://github.com/Fyusion/LLFF for original
 
-def _load_data(basedir):
+def _load_data(datadir):
     # poses are 4x4 [R T] matrices
-    poses = np.load(os.path.join(basedir, 'poses.npy'))
+    poses = np.load(os.path.join(datadir, 'poses.npy'))
 
     sfx = ''
 
-    imgdir = os.path.join(basedir, 'images' + sfx)
+    imgdir = os.path.join(datadir, 'images' + sfx)
     if not os.path.exists(imgdir):
         print(imgdir, 'does not exist')
         raise ValueError
 
     imgfiles = sorted([os.path.join(imgdir, f) for f in sorted(os.listdir(imgdir)) if
                        f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')], key=lambda i:
-    int(i.split("/")[-1].replace(".png", "")))
+    int(os.path.basename(i).split(".")[0]))  # sort by number
     print(poses.shape[0])
     print(len(imgfiles))
     if poses.shape[0] != len(imgfiles):
         print('Mismatch between imgs {} and poses {} !!!!'.format(len(imgfiles), poses.shape[-1]))
         raise ValueError
 
-    def imread(f):
-        if f.endswith('png'):
-            return imageio.imread(f, ignoregamma=True)
-        else:
-            return imageio.imread(f)
 
-    imgs = imgs = [imread(f) / 255. for f in imgfiles]
+    imgs = imgs = [np.array(Image.open(f)) / 255. for f in imgfiles]
     imgs = np.stack(imgs)
     poses[:, :3, 3] *= 0.001
     print('Loaded image data', imgs.shape, poses.shape)
@@ -93,8 +89,6 @@ def recenter_poses(poses):
     return poses
 
 
-#####################
-
 
 def spherify_poses(poses, bds):
     p34_to_44 = lambda p: np.concatenate([p, np.tile(np.reshape(np.eye(4)[-1, :], [1, 1, 4]), [p.shape[0], 1, 1])], 1)
@@ -154,10 +148,10 @@ def spherify_poses(poses, bds):
     return poses_reset, new_poses, bds
 
 
-def load_us_data(basedir):
+def load_us_data(datadir):
 
-    poses, imgs = _load_data(basedir)
-    print('Loaded', basedir)
+    poses, imgs = _load_data(datadir)
+    print('Loaded', datadir)
     images = imgs
 
     c2w = poses_avg(poses)
