@@ -26,8 +26,10 @@ def _load_data(datadir):
         print('Mismatch between imgs {} and poses {} !!!!'.format(len(imgfiles), poses.shape[-1]))
         raise ValueError
 
+    def imread(f):
+        return np.array(Image.open(f).convert('L'))
 
-    imgs = imgs = [np.array(Image.open(f)) / 255. for f in imgfiles]
+    imgs = imgs = [imread(f) / 255. for f in imgfiles]
     imgs = np.stack(imgs)
     poses[:, :3, 3] *= 0.001
     print('Loaded image data', imgs.shape, poses.shape)

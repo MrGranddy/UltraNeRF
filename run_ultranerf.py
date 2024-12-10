@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 from tqdm import trange
 
-from run_ultranerf_helpers import *
+from run_ultranerf_helpers import NeRF, get_embedder, get_rays_us_linear, img2mse
 from load_us import load_us_data
 
 import matplotlib.pyplot as plt
@@ -85,12 +85,13 @@ def render_method_convolutional_ultrasound(raw, z_vals):
     border_indicator = border_distribution.sample().detach()
 
     reflection_coeff = torch.sigmoid(raw[..., 1])
-    reflection_transmission = (1.0 - reflection_coeff) * border_indicator # PAPER CODE DIFFERENCE
+    reflection_transmission = 1.0 - reflection_coeff * border_indicator # PAPER CODE DIFFERENCE
     log_reflection_transmission = torch.log(reflection_transmission + 1e-8)
     log_reflection_transmission = exclusive_cumsum(log_reflection_transmission)
     reflection_transmission = torch.exp(log_reflection_transmission)
 
     # Border convolution
+
     border_indicator_conv_input = border_indicator.unsqueeze(0).unsqueeze(0)
     border_convolution = F.conv2d(border_indicator_conv_input, g_kernel, padding='same')
     border_convolution = border_convolution.squeeze(0).squeeze(0)
@@ -126,9 +127,74 @@ def render_method_convolutional_ultrasound(raw, z_vals):
         'scatter_amplitude': amplitude,
         'b': b,
         'r': r,
-        "transmission": transmission
+        "transmission": transmission,
+        "border_convolution": border_convolution
     }
     return ret
+
+def render_method_convolutional_ultrasound_alt(raw, z_vals):
+
+    # (7)
+    scattering_points_prob = torch.sigmoid(raw[..., 3])
+    scattering_points_distribution = torch.distributions.Bernoulli(probs=scattering_points_prob)
+    scattering_points = scattering_points_distribution.sample()
+
+    scattering_amplitude_mean = raw[..., 4]
+    scattering_amplitude = torch.randn_like(scattering_amplitude_mean) * scattering_amplitude_mean
+
+    scattering_map = scattering_points * scattering_amplitude
+
+    # (5)
+    dists = torch.abs(z_vals[..., :-1] - z_vals[..., 1:])
+    dists = torch.cat([dists, dists[:, -1:]], dim=1)
+
+    attenuation_coeff = torch.abs(raw[..., 0])
+    log_attenuation = -attenuation_coeff * dists
+    log_attenuation_transmission = exclusive_cumsum(log_attenuation)
+    attenuation_transmission = torch.exp(log_attenuation_transmission)
+
+    reflection_coeff = torch.sigmoid(raw[..., 1])
+
+    prob_border = torch.sigmoid(raw[..., 2])
+    border_distribution = torch.distributions.Bernoulli(probs=prob_border)
+    border_indicator = border_distribution.sample().detach()
+
+    reflection_transmission = (1.0 - reflection_coeff) * border_indicator # PAPER CODE DIFFERENCE
+    log_reflection_transmission = torch.log(reflection_transmission + 1e-8)
+    log_reflection_transmission = exclusive_cumsum(log_reflection_transmission)
+    reflection_transmission = torch.exp(log_reflection_transmission)
+
+    remaining_energy = attenuation_transmission * reflection_transmission
+
+    # (6)
+
+    scatter_spread = F.conv2d(scattering_map.unsqueeze(0).unsqueeze(0), g_kernel, padding='same').squeeze(0).squeeze(0)
+    backscattered_energy = scatter_spread * remaining_energy
+
+    # (4)
+
+    border_spread = F.conv2d(border_indicator.unsqueeze(0).unsqueeze(0), g_kernel, padding='same').squeeze(0).squeeze(0)
+    reflected_energy = torch.abs(remaining_energy * reflection_coeff) * border_spread
+
+    # (3)
+    intensity_map = backscattered_energy + reflected_energy
+
+    ret = {
+        'intensity_map': intensity_map,
+        'attenuation_coeff': attenuation_coeff,
+        'reflection_coeff': reflection_coeff,
+        'attenuation_transmission': attenuation_transmission,
+        'reflection_transmission': reflection_transmission,
+        'scattering_points_prob': scattering_points_prob,
+        'scattering_amplitude_mean': scattering_amplitude_mean,
+        'remaining_energy': remaining_energy,
+        'scatter_spread': scatter_spread,
+        'border_spread': border_spread,
+        'backscattered_energy': backscattered_energy,
+        'reflected_energy': reflected_energy,
+    }
+    return ret
+
 
 
 def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
@@ -242,6 +308,7 @@ def render_rays(ray_batch,
                 network_query_fn,
                 N_samples,
                 lindisp=False,
+                **kwargs
     ):
     """Volumetric rendering.
     """
@@ -285,7 +352,7 @@ def config_parser():
                         help='input data directory')
 
     # training options
-    parser.add_argument('--n_iters', type=int, default=10000)
+    parser.add_argument('--n_iters', type=int, default=100000)
     parser.add_argument("--ssim_filter_size", type=int, default=7)
     parser.add_argument("--ssim_lambda", type=float, default=0.75)
     parser.add_argument("--loss", type=str, default='l2')
@@ -355,7 +422,7 @@ def config_parser():
 
 
     # logging/saving options
-    parser.add_argument("--i_print",   type=int, default=200, 
+    parser.add_argument("--i_print",   type=int, default=10000, 
                         help='frequency of console printout and metric loggin')
     parser.add_argument("--i_img",     type=int, default=100, 
                         help='frequency of tensorboard image logging')
@@ -500,8 +567,23 @@ def train():
 
         dt = time.time()-time0
         if i%args.i_print==0:
+
+            rendering_path = os.path.join(basedir, expname, 'train_rendering')
+            os.makedirs(os.path.join(basedir, expname, 'train_rendering'), exist_ok=True)
+
             print(f"Step: {global_step}, Loss: {total_loss.item()}, Time: {dt}")
-        #####           end            #####
+
+            plt.figure(figsize=(16, 8))
+            for i, m in enumerate(rendering_output):
+                plt.subplot(3, 4, i+1)
+                plt.title(m)
+                plt.imshow(rendering_output[m].detach().cpu().numpy())
+
+            plt.savefig(os.path.join(rendering_path, '{:08d}.png'.format(global_step)), bbox_inches='tight', dpi=200)
+            plt.close()
+
+        # python run_ultra_nerf.py --config conf_us.txt --n_iters 200000 --i_print 1000
+
 
         # Rest is logging
         if i%args.i_weights==0:
