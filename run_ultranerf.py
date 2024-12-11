@@ -571,7 +571,7 @@ def train():
             rendering_path = os.path.join(basedir, expname, 'train_rendering')
             os.makedirs(os.path.join(basedir, expname, 'train_rendering'), exist_ok=True)
 
-            print(f"Step: {global_step}, Loss: {total_loss.item()}, Time: {dt}")
+            print(f"Step: {global_step}, Loss: {total_loss.item()}, Time: {dt}") # type: ignore
 
             plt.figure(figsize=(16, 8))
             for i, m in enumerate(rendering_output):

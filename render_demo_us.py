@@ -1,78 +1,52 @@
 import os
-import torch
-import numpy as np
-import imageio
-import pprint
-import pathlib
 import argparse
+import numpy as np
+import pprint
+import shutil
+import torch
 
-import matplotlib.pyplot as plt
+from PIL import Image
 
-import run_ultranerf  # Ensure this is the PyTorch version
+import run_ultranerf as run_nerf_ultrasound
 from load_us import load_us_data
 
-# Set device
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-def config_parser():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--basedir", type=str, default='./logs/',
-                        help='where to store checkpoints and logs')
-    parser.add_argument("--expname", type=str, required=True,
-                        help='experiment name')
-    parser.add_argument("--model_no", type=str, required=True,
-                        help='model checkpoint to use, e.g., model_200000')
-    parser.add_argument("--datadir", type=str, default='./data/us_data',
-                        help='input data directory')
-    parser.add_argument("--output_dir", type=str, default=None,
-                        help='directory to save outputs, default is basedir/expname/output_maps')
-    parser.add_argument("--downsample", type=int, default=1,
-                        help='downsampling factor for rendering')
-    parser.add_argument("--save_interval", type=int, default=300,
-                        help='interval at which to save parameters')
-    return parser
-
-def show_colorbar(image, name=None, cmap='rainbow'):
-    figure = plt.figure()
-    plt.imshow(image, cmap=cmap)
-    plt.tick_params(top=False, bottom=False, left=False, right=False,
-                    labelleft=False, labelbottom=False)
-    m = plt.cm.ScalarMappable(cmap=cmap)
-    m.set_clim(0., 1.)
-    plt.colorbar(m)
-    if name:
-        figure.savefig(name)
-    plt.close(figure)
-
 if __name__ == '__main__':
-    parser = config_parser()
-    args = parser.parse_args()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    basedir = args.basedir
-    expname = args.expname
-    model_no = args.model_no
-    datadir = args.datadir
-    output_dir = args.output_dir
-    down = args.downsample
-    save_it = args.save_interval
+    parser_console = argparse.ArgumentParser()
+    parser_console.add_argument('--logdir', type=str, default='logs')
+    parser_console.add_argument('--expname', type=str, default='test')
+    parser_console.add_argument('--model_epoch', type=int, default=98000)
+    args_console = parser_console.parse_args()
 
-    if output_dir is None:
-        output_dir = os.path.join(basedir, expname, f'output_maps_{model_no}')
-
-    config = os.path.join(basedir, expname, 'config.txt')
+    config = os.path.join(args_console.logdir, args_console.expname, 'config.txt')
     print('Args:')
     with open(config, 'r') as f:
         print(f.read())
 
-    # Parse the config file
-    parser = run_ultranerf.config_parser()
-    args_list = ['--config', config]
-    args_render = parser.parse_args(args_list)
-    args_render.ft_path = os.path.join(basedir, expname, model_no + '.tar')
+    parser = run_nerf_ultrasound.config_parser()
+    model_no = f'{args_console.model_epoch:06d}'
+
+    # Adjust here if your trained model checkpoint file differs in naming
+    # For the above code snippet, checkpoints are saved as {step}.tar
+    ft_path = os.path.join(args_console.logdir, args_console.expname, model_no + ".tar")
+    args = parser.parse_args(['--config', config, '--ft_path', ft_path])
 
     print('Loaded args')
-    model_name = os.path.basename(args_render.datadir)
-    images, poses, i_test = load_us_data(args_render.datadir)
+
+    model_name = args.datadir.split("/")[-1]
+    images, poses, i_test = load_us_data(args.datadir)
+
+    # If you have logic for slicing images depending on expname, reproduce it here
+    if args_console.expname.endswith('right'):
+        size = images.shape[2] // 3
+        images = images[:, :, size:]
+    elif args_console.expname.endswith('left'):
+        size = images.shape[2] // 3
+        images = images[:, :, :-size]
+    elif args_console.expname.endswith('partial'):
+        images = images[:, :-images.shape[1] // 3, :]
+
     H, W = images[0].shape
     H = int(H)
     W = int(W)
@@ -80,12 +54,15 @@ if __name__ == '__main__':
     images = images.astype(np.float32)
     poses = poses.astype(np.float32)
 
-    near = 0.
-    far = args_render.probe_depth * 0.001
+    print('Loaded image data')
+    print(images.shape)
+    print(poses.shape)
 
-    # Create NeRF model
-    _, render_kwargs_test, start, grad_vars, models = run_ultranerf.create_nerf(args_render)
-    render_kwargs_test["args"] = args_render
+    near = 0.
+    far = args.probe_depth * 0.001
+
+    # Create nerf model
+    _, render_kwargs_test, start, grad_vars, optimizer = run_nerf_ultrasound.create_nerf(args)
     bds_dict = {
         'near': torch.tensor(near, dtype=torch.float32, device=device),
         'far': torch.tensor(far, dtype=torch.float32, device=device),
@@ -94,52 +71,89 @@ if __name__ == '__main__':
 
     print('Render kwargs:')
     pprint.pprint(render_kwargs_test)
-    sw = args_render.probe_width * 0.001 / float(W)
-    sh = args_render.probe_depth * 0.001 / float(H)
 
+    sw = args.probe_width * 0.001 / float(W)
+    sh = args.probe_depth * 0.001 / float(H)
+
+    # If you want a downsample factor, set here. For now, just keep as original.
+    # down = 4
     render_kwargs_fast = {k: render_kwargs_test[k] for k in render_kwargs_test}
 
-    # Set up output directories
-    output_dir_params = os.path.join(output_dir, 'params')
-    output_dir_output = os.path.join(output_dir, 'output')
-    os.makedirs(output_dir_params, exist_ok=True)
-    os.makedirs(output_dir_output, exist_ok=True)
+    frames = []
+    impedance_map = []
+    map_number = 0
+    output_dir = "{}/{}/output_maps_{}_{}_{}".format(args_console.logdir, args_console.expname, model_name, model_no, map_number)
+    output_dir_params = "{}/params".format(output_dir)
+    output_dir_output = "{}/output".format(output_dir)
 
+    if os.path.exists(output_dir):
+        shutil.rmtree(output_dir)
+
+    os.makedirs(output_dir)
+    os.makedirs(output_dir_params)
+    os.makedirs(output_dir_output)
+
+    save_it = 300
+
+    # We'll store the parameters from rendering in a dict of lists
     rendering_params_save = None
-    for i, c2w in enumerate(poses):
-        print(f"Rendering frame {i}")
 
-        c2w = torch.from_numpy(c2w[:3, :4]).float().to(device)
-        rendering_params = run_ultranerf.render_us(H, W, sw, sh, c2w=c2w, **render_kwargs_fast)
-        output_image = rendering_params['intensity_map'].detach().cpu().numpy().transpose()
-        output_image_uint8 = (output_image * 255).astype(np.uint8)
-        imageio.imwrite(os.path.join(output_dir_output, f"Generated_{i}.png"),
-                        output_image_uint8)
+    # Convert poses and run rendering
+    with torch.no_grad():
+        for i, c2w in enumerate(poses):
+            c2w_torch = torch.from_numpy(c2w[:3, :4]).to(device)
+            # render_us returns a dict of torch tensors
+            rendering_params = run_nerf_ultrasound.render_us(H, W, sw, sh, c2w=c2w_torch, **render_kwargs_fast)
 
-        # Collect rendering parameters
-        if rendering_params_save is None:
-            rendering_params_save = {key: [] for key in rendering_params.keys()}
+            # Convert intensity_map to uint8 and save
+            # Intensity map is (H, W), we need to transpose to (W, H) if needed, but original code transposed.
+            # The original TF code did: tf.transpose(image), so we replicate that:
+            intensity_map = rendering_params['intensity_map']  # [H, W]
+            intensity_map_transposed = intensity_map.permute(1,0)  # [W, H]
 
-        for key in rendering_params:
-            value = rendering_params[key].detach().cpu().numpy().transpose()
-            rendering_params_save[key].append(value)
+            # Convert from [0,1] to uint8
+            img_to_save = (intensity_map_transposed * 255.0).clamp(0,255).to(torch.uint8).cpu().numpy()
+            Image.fromarray(img_to_save).save(os.path.join(output_dir_output, f"Generated_{1000 + i}.png"))
 
-        # Save parameters at intervals
-        if (i + 1) % save_it == 0:
-            for key, value_list in rendering_params_save.items():
-                np_to_save = np.array(value_list)
-                f_name = os.path.join(output_dir_params, f"{key}.npy")
-                if os.path.exists(f_name):
-                    np_existing = np.load(f_name)
-                    np_to_save = np.concatenate((np_existing, np_to_save), axis=0)
-                np.save(f_name, np_to_save)
-            rendering_params_save = {key: [] for key in rendering_params.keys()}
+            # Save parameters for later
+            if rendering_params_save is None:
+                # Initialize the storage dict
+                rendering_params_save = {}
+                for key in rendering_params:
+                    rendering_params_save[key] = []
 
-    # Save any remaining parameters
-    if rendering_params_save:
-        for key, value_list in rendering_params_save.items():
-            np_to_save = np.array(value_list)
-            f_name = os.path.join(output_dir_params, f"{key}.npy")
+            for key, value in rendering_params.items():
+                # Transpose value to match original TF code style
+                # Original code: tf.transpose(value)
+                val_t = value.permute(1,0)  # [W,H]
+                rendering_params_save[key].append(val_t.cpu().numpy())
+
+            # Save intermediate results
+            if i == save_it:
+                # Save all parameters up to this point
+                for key, value in rendering_params_save.items():
+                    np_to_save = np.array(value)
+                    np.save(f"{output_dir_params}/{key}.npy", np_to_save)
+                rendering_params_save = None
+
+            elif i != save_it and i % save_it == 0 and i != 0:
+                # Append results to existing files
+                for key, value in rendering_params_save.items():
+                    f_name = f"{output_dir_params}/{key}.npy"
+                    np_to_save = np.array(value)
+                    if os.path.exists(f_name):
+                        np_existing = np.load(f_name)
+                        new_to_save = np.concatenate((np_existing, np_to_save), axis=0)
+                        np.save(f_name, new_to_save)
+                    else:
+                        np.save(f_name, np_to_save)
+                rendering_params_save = None
+
+    # Save any remaining parameters after loop ends
+    if rendering_params_save is not None:
+        for key, value in rendering_params_save.items():
+            f_name = f"{output_dir_params}/{key}.npy"
+            np_to_save = np.array(value)
             if os.path.exists(f_name):
                 np_existing = np.load(f_name)
                 np_to_save = np.concatenate((np_existing, np_to_save), axis=0)
