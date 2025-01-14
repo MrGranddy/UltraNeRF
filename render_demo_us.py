@@ -1,51 +1,51 @@
-import os
 import argparse
-import numpy as np
+import os
 import pprint
 import shutil
-import torch
 
+import numpy as np
+import torch
 from PIL import Image
 
 import run_ultranerf as run_nerf_ultrasound
 from load_us import load_us_data
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     parser_console = argparse.ArgumentParser()
-    parser_console.add_argument('--logdir', type=str, default='logs')
-    parser_console.add_argument('--expname', type=str, default='test')
-    parser_console.add_argument('--model_epoch', type=int, default=98000)
+    parser_console.add_argument("--logdir", type=str, default="logs")
+    parser_console.add_argument("--expname", type=str, default="test")
+    parser_console.add_argument("--model_epoch", type=int, default=98000)
     args_console = parser_console.parse_args()
 
-    config = os.path.join(args_console.logdir, args_console.expname, 'config.txt')
-    print('Args:')
-    with open(config, 'r') as f:
+    config = os.path.join(args_console.logdir, args_console.expname, "config.txt")
+    print("Args:")
+    with open(config, "r") as f:
         print(f.read())
 
     parser = run_nerf_ultrasound.config_parser()
-    model_no = f'{args_console.model_epoch:06d}'
+    model_no = f"{args_console.model_epoch:06d}"
 
     # Adjust here if your trained model checkpoint file differs in naming
     # For the above code snippet, checkpoints are saved as {step}.tar
     ft_path = os.path.join(args_console.logdir, args_console.expname, model_no + ".tar")
-    args = parser.parse_args(['--config', config, '--ft_path', ft_path])
+    args = parser.parse_args(["--config", config, "--ft_path", ft_path])
 
-    print('Loaded args')
+    print("Loaded args")
 
     model_name = args.datadir.split("/")[-1]
     images, poses, i_test = load_us_data(args.datadir)
 
     # If you have logic for slicing images depending on expname, reproduce it here
-    if args_console.expname.endswith('right'):
+    if args_console.expname.endswith("right"):
         size = images.shape[2] // 3
         images = images[:, :, size:]
-    elif args_console.expname.endswith('left'):
+    elif args_console.expname.endswith("left"):
         size = images.shape[2] // 3
         images = images[:, :, :-size]
-    elif args_console.expname.endswith('partial'):
-        images = images[:, :-images.shape[1] // 3, :]
+    elif args_console.expname.endswith("partial"):
+        images = images[:, : -images.shape[1] // 3, :]
 
     H, W = images[0].shape
     H = int(H)
@@ -54,22 +54,24 @@ if __name__ == '__main__':
     images = images.astype(np.float32)
     poses = poses.astype(np.float32)
 
-    print('Loaded image data')
+    print("Loaded image data")
     print(images.shape)
     print(poses.shape)
 
-    near = 0.
+    near = 0.0
     far = args.probe_depth * 0.001
 
     # Create nerf model
-    _, render_kwargs_test, start, grad_vars, optimizer = run_nerf_ultrasound.create_nerf(args)
+    _, render_kwargs_test, start, grad_vars, optimizer = (
+        run_nerf_ultrasound.create_nerf(args)
+    )
     bds_dict = {
-        'near': torch.tensor(near, dtype=torch.float32, device=device),
-        'far': torch.tensor(far, dtype=torch.float32, device=device),
+        "near": torch.tensor(near, dtype=torch.float32, device=device),
+        "far": torch.tensor(far, dtype=torch.float32, device=device),
     }
     render_kwargs_test.update(bds_dict)
 
-    print('Render kwargs:')
+    print("Render kwargs:")
     pprint.pprint(render_kwargs_test)
 
     sw = args.probe_width * 0.001 / float(W)
@@ -82,7 +84,9 @@ if __name__ == '__main__':
     frames = []
     impedance_map = []
     map_number = 0
-    output_dir = "{}/{}/output_maps_{}_{}_{}".format(args_console.logdir, args_console.expname, model_name, model_no, map_number)
+    output_dir = "{}/{}/output_maps_{}_{}_{}".format(
+        args_console.logdir, args_console.expname, model_name, model_no, map_number
+    )
     output_dir_params = "{}/params".format(output_dir)
     output_dir_output = "{}/output".format(output_dir)
 
@@ -103,17 +107,27 @@ if __name__ == '__main__':
         for i, c2w in enumerate(poses):
             c2w_torch = torch.from_numpy(c2w[:3, :4]).to(device)
             # render_us returns a dict of torch tensors
-            rendering_params = run_nerf_ultrasound.render_us(H, W, sw, sh, c2w=c2w_torch, **render_kwargs_fast)
+            rendering_params = run_nerf_ultrasound.render_us(
+                H, W, sw, sh, c2w=c2w_torch, **render_kwargs_fast
+            )
 
             # Convert intensity_map to uint8 and save
             # Intensity map is (H, W), we need to transpose to (W, H) if needed, but original code transposed.
             # The original TF code did: tf.transpose(image), so we replicate that:
-            intensity_map = rendering_params['intensity_map']  # [H, W]
-            intensity_map_transposed = intensity_map.permute(1,0)  # [W, H]
+            intensity_map = rendering_params["intensity_map"]  # [H, W]
+            intensity_map_transposed = intensity_map.permute(1, 0)  # [W, H]
 
             # Convert from [0,1] to uint8
-            img_to_save = (intensity_map_transposed * 255.0).clamp(0,255).to(torch.uint8).cpu().numpy()
-            Image.fromarray(img_to_save).save(os.path.join(output_dir_output, f"Generated_{1000 + i}.png"))
+            img_to_save = (
+                (intensity_map_transposed * 255.0)
+                .clamp(0, 255)
+                .to(torch.uint8)
+                .cpu()
+                .numpy()
+            )
+            Image.fromarray(img_to_save).save(
+                os.path.join(output_dir_output, f"Generated_{1000 + i}.png")
+            )
 
             # Save parameters for later
             if rendering_params_save is None:
@@ -125,7 +139,7 @@ if __name__ == '__main__':
             for key, value in rendering_params.items():
                 # Transpose value to match original TF code style
                 # Original code: tf.transpose(value)
-                val_t = value.permute(1,0)  # [W,H]
+                val_t = value.permute(1, 0)  # [W,H]
                 rendering_params_save[key].append(val_t.cpu().numpy())
 
             # Save intermediate results

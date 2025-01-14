@@ -164,3 +164,4 @@ cython_debug/
 # Additional exclusion 
 *.npy
 logs/
+confidence_map/
