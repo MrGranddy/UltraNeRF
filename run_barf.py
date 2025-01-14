@@ -337,6 +337,7 @@ def config_parser():
     parser.add_argument("--c2f", type=tuple, default=None)
     parser.add_argument("--border_lambda", type=float, default=0.0)
     parser.add_argument("--tensorboard", action="store_true")
+    parser.add_argument("--confmap", type=bool, default=False)
 
     parser.add_argument("--pose_lr", type=float, default=1e-3)
     parser.add_argument("--pose_lr_end", type=float, default=1e-5)
@@ -509,7 +510,7 @@ def train():
     K = None
 
     if args.dataset_type == "us":
-        images, poses, i_test = load_us_data(args.datadir)
+        images, poses, i_test = load_us_data(args.datadir, confmap=args.confmap)
 
         if not isinstance(i_test, list):
             i_test = [i_test]
